@@ -19,14 +19,6 @@ import (
 	tester "6.5840/tester1"
 )
 
-type raftState int
-
-const (
-	Follower  raftState = iota // 0
-	Candidate                  // 1
-	Leader                     // 2
-)
-
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -35,42 +27,9 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	id            int
-	state         raftState     //当前状态
-	lastHeartBeat time.Time     //上次心跳时间
-	overtime      time.Duration //超时时间
-	currentTerm   int           //最新任期
-	votedFor      int           //本任期内获得投票的peer
-	logs          []*RaftLog    //log合集
-	commitIndex   int           //已提交的最新日志的索引
-	lastApplied   int           //最新索引
-	nextIndex     []int         //for leader 发送给每个服务器的下一个log的index
-	matchIndex    []int         //for leader 每个服务器中的最高日志
-
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
-}
-
-type RaftLog struct {
-	Term int
-}
-
-// 添加日志/心跳
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderID     int
-	PrevLogIndex int
-	PrevLogTerm  int
-	Logs         []*RaftLog
-}
-
-type AppendEntriesReply struct {
-	Isvoted bool
-}
-
-func (rf *Raft) AppendHandler(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 
 }
 
@@ -80,13 +39,6 @@ func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
-	term = rf.currentTerm
-	if rf.state == Leader {
-		isleader = true
-	} else {
-		isleader = false
-	}
-	// isleader =
 	// Your code here (3A).
 	return term, isleader
 }
@@ -149,34 +101,17 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
-	Term        int
-	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
-	// server := args.ServerId
-	// println(server)
-	// rf.sendRequestVote(server, args, reply) //向其他服务器发送投票请求
-	reply.VoteGranted = false
-	if args.Term < rf.currentTerm {
-		return
-	}
-	// lastLogIndex := len(rf.logs) - 1
-	// lastLogTerm := rf.logs[lastLogIndex].Term
-
-	reply.VoteGranted = true
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -208,23 +143,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	reply.VoteGranted = true
 	return ok
-}
-
-func (rf *Raft) sendHeartBeat() {
-	for {
-		for _, server := range rf.peers {
-			args := AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderID:     rf.me,
-				PrevLogIndex: rf.lastApplied,
-			}
-			reply := AppendEntriesReply{}
-			server.Call("Raft.AppendHandler", &args, &reply)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -270,76 +189,14 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-		// println(rf.me)
+
 		// Your code here (3A)
 		// Check if a leader election should be started.
-		// isNeedLeader := true
-		if time.Since(rf.lastHeartBeat) > rf.overtime {
-			rf.startElection()
-		}
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
-	}
-}
-
-func (rf *Raft) startElection() {
-	tickets := 0
-	rf.state = Candidate
-	for i, server := range rf.peers {
-		if rf.me == i {
-			tickets++
-			continue
-		}
-		args := RequestVoteArgs{
-			Term:        rf.currentTerm,
-			CandidateId: rf.me,
-			// LastLogIndex: rf.logs[len(rf.logs)-1].Term,
-			// LastLogTerm:  rf.logs[0].Term,
-		}
-		rf.resetTime()
-		reply := RequestVoteReply{}
-		ok := server.Call("Raft.RequestVote", &args, &reply)
-		if ok {
-			if reply.VoteGranted {
-				tickets++
-			}
-		}
-
-	}
-	//因为要给自己投票，所以只要等于/2就行了
-	// DPrintf("I am", rf.me, "my tickets number is", tickets)
-	if tickets >= len(rf.peers)/2+1 && rf.me == 0 {
-		rf.state = Leader
-		rf.currentTerm++
-		DPrintf("Iam %d,my tickets number is %d", rf.me, rf.state)
-		go rf.sendHeartBeat()
-	}
-	if rf.state != Leader {
-		rf.state = Follower
-	}
-}
-
-// 辅助函数：生成一个随机的选举超时时间
-func (rf *Raft) generateElectionTimeout() time.Duration {
-	// 6.5840 实验通常建议 150ms 到 300ms
-	// 但根据你的测试需要，可以适当调整范围
-	min := 150
-	max := 300
-	// rand.Intn 是 [0, n)
-	return time.Duration(min+rand.Intn(max-min+1)) * time.Millisecond
-}
-
-// 辅助函数：重置选举超时计时器
-func (rf *Raft) resetTime() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.lastHeartBeat = time.Now()
-	rf.overtime = rf.generateElectionTimeout()
-	if rf.me == 0 {
-		DPrintf("I am %d,下次超时时间%v", rf.me, rf.lastHeartBeat.Add(rf.overtime))
 	}
 }
 
@@ -358,13 +215,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.state = Follower
-	rf.overtime = rf.generateElectionTimeout()
-	rf.votedFor = -1
-	rf.commitIndex = 0
-	rf.lastApplied = 0
-
-	// rf.overtime
 
 	// Your initialization code here (3A, 3B, 3C).
 
