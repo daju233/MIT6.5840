@@ -8,6 +8,7 @@ package raft
 
 import (
 	//	"bytes"
+
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -19,27 +20,53 @@ import (
 	tester "6.5840/tester1"
 )
 
+type raftState int
+
+const (
+	Follower  raftState = iota // 0
+	Candidate                  // 1
+	Leader                     // 2
+) //RAFT STATE
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *tester.Persister   // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
+	mu               sync.Mutex          // Lock to protect shared access to this peer's state
+	peers            []*labrpc.ClientEnd // RPC end points of all peers
+	persister        *tester.Persister   // Object to hold this peer's persisted state
+	me               int                 // this peer's index into peers[]
+	dead             int32               // set by Kill()
+	state            raftState           // raft state
+	term             int
+	electionTimeout  time.Time //选举超时时间
+	votedFor         int       //投票给谁了
+	heartbeatTimeout time.Time //心跳超时时间
 
+	// lastHeartBeat time.Time //上次心跳时间
+	// lastElection  time.Time //上次选举时间
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
 }
 
-// return currentTerm and whether this server
+type RaftLog struct {
+	ID int
+}
+
+// return term and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	var term int
 	var isleader bool
 	// Your code here (3A).
+	term = rf.term
+	if rf.state == Leader {
+		isleader = true
+	} else {
+		isleader = false
+	}
 	return term, isleader
 }
 
@@ -101,17 +128,52 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	SenderId   int
+	SenderTerm int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	Voted      bool
+	SenderTerm int
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	////fmt.Printf("[%d] begins grasping the lock...", rf.me)
+	//fmt.Printf("%v[RequestVote] from %v at args term: %v and current term: %v\n", args.CandidateId, rf.me, args.SenderTerm, rf.term)
+	//竞选leader的节点任期小于等于自己的任期，则反对票(为什么等于情况也反对票呢？因为candidate节点在发送requestVote rpc之前会将自己的term+1)
+	if args.SenderTerm < rf.term {
+		reply.Voted = false
+		reply.SenderTerm = rf.term
+		return
+	}
+	if args.SenderTerm > rf.term {
+		rf.term = args.SenderTerm
+		rf.votedFor = -1
+		rf.state = Follower
+		//rf.ToFollower()
+	}
+	reply.SenderTerm = rf.term
+	//Lab2B的日志复制直接确定为true
+	update := true
+	if (rf.votedFor == -1 || rf.votedFor == args.SenderId) && update {
+		//if rf.votedFor == -1 {
+		//竞选任期大于自身任期，则更新自身任期，并转为follower
+		rf.votedFor = args.SenderId
+		rf.state = Follower
+		DPrintf("我%d认为这是选举时候的修改选举时间", rf.me)
+		rf.resetElectionTime() //自己的票已经投出时就转为follower状态
+		reply.Voted = true     // 默认设置响应体为投同意票状态
+		DPrintf("%d: 同意把票投给%d, 它的任期是%d", rf.me, args.SenderId, args.SenderTerm)
+	} else {
+		reply.Voted = false
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -143,6 +205,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendRequestAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestAppendEntries", args, reply)
 	return ok
 }
 
@@ -189,6 +256,31 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
+		// if time.Now().After(rf.electionTimeout) {
+		// 	DPrintf("%d,状态 %d,超时时间 %v,term %d", rf.me, rf.state, rf.electionTimeout, rf.term)
+		// 	rf.StartElection()
+		// }
+		rf.mu.Lock()
+		state := rf.state
+		rf.mu.Unlock()
+		switch state {
+		case Follower:
+			fallthrough
+		case Candidate:
+			if time.Now().After(rf.electionTimeout) {
+				rf.StartElection()
+			}
+		case Leader:
+			isHeartBeat := false
+			// 检测是需要发送单纯的心跳还是发送日志
+			// 心跳定时器过期则发送心跳，否则发送日志
+			if time.Now().After(rf.heartbeatTimeout) {
+				isHeartBeat = true
+				DPrintf("我是leader%d,任期%d,现在我要开始发送心跳了", rf.me, rf.term)
+				rf.resetHeartbeatTime()
+			}
+			rf.StartAppendEntries(isHeartBeat)
+		}
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
@@ -215,7 +307,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
+	rf.state = Follower
+	rf.electionTimeout = time.Now().Add(time.Duration(150+rand.Intn(151)) * time.Millisecond)
+	rf.term = 0
+	rf.votedFor = -1
 	// Your initialization code here (3A, 3B, 3C).
 
 	// initialize from state persisted before a crash
